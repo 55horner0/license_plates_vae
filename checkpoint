@@ -1,0 +1,2 @@
+model_checkpoint_path: "draw_plates_model.ckpt"
+all_model_checkpoint_paths: "draw_plates_model.ckpt"

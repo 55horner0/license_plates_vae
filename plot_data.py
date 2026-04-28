@@ -39,7 +39,7 @@ def xrecons_grid(X,B,A):
 if __name__ == '__main__':
 	prefix=sys.argv[1]
 	out_file=sys.argv[2]
-	[C,Lxs,Lzs]=np.load(out_file)
+	[C,Lxs,Lzs]=np.load(out_file, allow_pickle=True)
 	T,batch_size,img_size=C.shape
 	X=1.0/(1.0+np.exp(-C)) # x_recons=sigmoid(canvas)
 	B=A=int(np.sqrt(img_size))

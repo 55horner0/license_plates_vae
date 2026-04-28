@@ -1,0 +1,23 @@
+======================================================================
+COMBINED LICENSE PLATE DATASET - SUMMARY REPORT
+======================================================================
+
+TARGET SIZE: 96×32 pixels
+TOTAL IMAGES: 1872
+
+DATA SPLITS:
+  - Train: 1497 images
+  - Val:   187 images
+  - Test:  188 images
+
+SOURCE BREAKDOWN:
+  - original: 402 images
+  - european_train: 1176 images
+  - european_val: 148 images
+  - european_test: 146 images
+
+STATISTICS (Combined Dataset):
+  - Mean pixel value: 0.3588
+  - Std pixel value:  0.3190
+  - Min pixel value:  0.0000
+  - Max pixel value:  1.0000

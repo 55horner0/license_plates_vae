@@ -1,0 +1,14 @@
+LICENSE PLATE DATASET STATISTICS
+========================================
+dataset             : train
+num_samples         : 1497
+image_width         : 96
+image_height        : 32
+total_pixels        : 3072
+mean_pixel          : 0.35827645659446716
+std_pixel           : 0.31882768869400024
+min_pixel           : 0.0
+max_pixel           : 1.0
+percentile_25       : 0.03529411926865578
+percentile_50       : 0.29411765933036804
+percentile_75       : 0.6274510025978088

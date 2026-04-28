@@ -1,0 +1,14 @@
+LICENSE PLATE DATASET STATISTICS
+========================================
+dataset             : test
+num_samples         : 188
+image_width         : 96
+image_height        : 32
+total_pixels        : 3072
+mean_pixel          : 0.362337201833725
+std_pixel           : 0.32165172696113586
+min_pixel           : 0.0
+max_pixel           : 1.0
+percentile_25       : 0.03529411926865578
+percentile_50       : 0.29411765933036804
+percentile_75       : 0.6549019813537598
