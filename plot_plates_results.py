@@ -1,365 +1,379 @@
-# plot_plates_results.py
-import tensorflow as tf
+#!/usr/bin/env python
+"""Visualise trained DRAW model results.
+
+IMPORTANT: all parameters below must exactly match draw_plates_rectangle2.py
+so that the checkpoint variables can be restored into this graph.
+"""
+
+import os
 import numpy as np
 import matplotlib.pyplot as plt
-import os
+import tensorflow as tf
 
-# ============================================
-# MODEL PARAMETERS (MUST MATCH TRAINING)
-# ============================================
+# ============================================================
+# PARAMETERS — MUST MATCH draw_plates_rectangle2.py
+# ============================================================
 
-A, B = 96, 32  # Width, Height
-img_size = A * B
-enc_size = 512
-dec_size = 512
-read_n = 12
-write_n = 12
-z_size = 10
-T = 30
+A, B      = 96, 32
+img_size  = A * B
+
+enc_size  = 256
+dec_size  = 256
+read_n_x  = 16
+read_n_y  = 6
+write_n_x = 16
+write_n_y = 6
+z_size    = 64
+T         = 50
 batch_size = 32
-eps = 1e-8
-read_attn = True
-write_attn = True
+eps        = 1e-8
+kl_weight  = 0.1
 
-# ============================================
-# MODEL FUNCTIONS (COPY FROM YOUR TRAINING)
-# ============================================
+# ============================================================
+# MODEL FUNCTIONS — mirrors draw_plates_rectangle2.py exactly
+# ============================================================
 
-def linear(x, output_dim, scope=None):
-    with tf.variable_scope(scope or "linear"):
-        w = tf.get_variable("w", [x.get_shape()[1], output_dim])
-        b = tf.get_variable("b", [output_dim], initializer=tf.constant_initializer(0.0))
+def linear(x, out_dim, scope):
+    with tf.variable_scope(scope, reuse=tf.AUTO_REUSE):
+        w = tf.get_variable("w", [x.get_shape()[1], out_dim])
+        b = tf.get_variable("b", [out_dim],
+                            initializer=tf.constant_initializer(0.0))
         return tf.matmul(x, w) + b
 
-def filterbank(gx, gy, sigma2, delta, N):
-    grid_i = tf.reshape(tf.cast(tf.range(N), tf.float32), [1, -1])
-    mu_x = gx + (grid_i - N / 2 - 0.5) * delta
-    mu_y = gy + (grid_i - N / 2 - 0.5) * delta
-    a = tf.reshape(tf.cast(tf.range(A), tf.float32), [1, 1, -1])
-    b = tf.reshape(tf.cast(tf.range(B), tf.float32), [1, 1, -1])
-    mu_x = tf.reshape(mu_x, [-1, N, 1])
-    mu_y = tf.reshape(mu_y, [-1, N, 1])
-    sigma2 = tf.reshape(sigma2, [-1, 1, 1])
-    Fx = tf.exp(-tf.square(a - mu_x) / (2 * sigma2))
-    Fy = tf.exp(-tf.square(b - mu_y) / (2 * sigma2))
-    Fx = Fx / tf.maximum(tf.reduce_sum(Fx, 2, keep_dims=True), eps)
-    Fy = Fy / tf.maximum(tf.reduce_sum(Fy, 2, keep_dims=True), eps)
+
+def filterbank(gx, gy, sigma2, delta_x, delta_y, Nx, Ny):
+    grid_x = tf.reshape(tf.cast(tf.range(Nx), tf.float32), [1, -1])
+    grid_y = tf.reshape(tf.cast(tf.range(Ny), tf.float32), [1, -1])
+    mu_x   = gx + (grid_x - Nx / 2.0 - 0.5) * delta_x
+    mu_y   = gy + (grid_y - Ny / 2.0 - 0.5) * delta_y
+    a      = tf.reshape(tf.cast(tf.range(A), tf.float32), [1, 1, -1])
+    b      = tf.reshape(tf.cast(tf.range(B), tf.float32), [1, 1, -1])
+    mu_x   = tf.reshape(mu_x, [-1, Nx, 1])
+    mu_y   = tf.reshape(mu_y, [-1, Ny, 1])
+    s2     = tf.reshape(sigma2, [-1, 1, 1])
+    Fx     = tf.exp(-tf.square(a - mu_x) / (2.0 * s2))
+    Fy     = tf.exp(-tf.square(b - mu_y) / (2.0 * s2))
+    Fx     = Fx / tf.maximum(tf.reduce_sum(Fx, 2, keep_dims=True), eps)
+    Fy     = Fy / tf.maximum(tf.reduce_sum(Fy, 2, keep_dims=True), eps)
     return Fx, Fy
 
-def attn_window(scope, h_dec, N):
-    with tf.variable_scope(scope, reuse=tf.AUTO_REUSE):
-        params = linear(h_dec, 5, scope="attn_params")
-    gx_, gy_, log_sigma2, log_delta, log_gamma = tf.split(params, 5, 1)
-    gx = (A + 1) / 2 * (gx_ + 1)
-    gy = (B + 1) / 2 * (gy_ + 1)
-    sigma2 = tf.exp(log_sigma2)
-    delta = (max(A, B) - 1) / (N - 1) * tf.exp(log_delta)
-    Fx, Fy = filterbank(gx, gy, sigma2, delta, N)
-    gamma = tf.exp(log_gamma)
+
+def attn_window(scope, h_dec, Nx, Ny):
+    params  = linear(h_dec, 6, scope=scope + "_params")
+    gx_, gy_, log_sigma2, log_delta_x, log_delta_y, log_gamma = \
+        tf.split(params, 6, axis=1)
+    gx      = (A + 1) / 2.0 * (gx_ + 1)
+    gy      = (B + 1) / 2.0 * (gy_ + 1)
+    sigma2  = tf.exp(log_sigma2)
+    delta_x = (A - 1) / (Nx - 1) * tf.exp(log_delta_x)
+    delta_y = (B - 1) / (Ny - 1) * tf.exp(log_delta_y)
+    gamma   = tf.exp(log_gamma)
+    Fx, Fy  = filterbank(gx, gy, sigma2, delta_x, delta_y, Nx, Ny)
     return Fx, Fy, gamma
 
-def read_attn(x, x_hat, h_dec_prev):
-    Fx, Fy, gamma = attn_window("read", h_dec_prev, read_n)
-    def filter_img(img, Fx, Fy, gamma, N):
-        Fxt = tf.transpose(Fx, perm=[0, 2, 1])
+
+def read_op(x_in, x_hat, h_dec_prev):
+    Fx, Fy, gamma = attn_window("read", h_dec_prev, read_n_x, read_n_y)
+    def glimpse(img):
+        Fxt = tf.transpose(Fx, [0, 2, 1])
         img = tf.reshape(img, [-1, B, A])
-        glimpse = tf.matmul(Fy, tf.matmul(img, Fxt))
-        glimpse = tf.reshape(glimpse, [-1, N * N])
-        return glimpse * tf.reshape(gamma, [-1, 1])
-    x_filtered = filter_img(x, Fx, Fy, gamma, read_n)
-    x_hat_filtered = filter_img(x_hat, Fx, Fy, gamma, read_n)
-    return tf.concat([x_filtered, x_hat_filtered], 1)
+        g   = tf.matmul(Fy, tf.matmul(img, Fxt))
+        return tf.reshape(g, [-1, read_n_y * read_n_x]) * tf.reshape(gamma, [-1, 1])
+    return tf.concat([glimpse(x_in), glimpse(x_hat)], axis=1)
 
-def encode(state, input_tensor):
-    with tf.variable_scope("encoder", reuse=tf.AUTO_REUSE):
-        return lstm_enc(input_tensor, state)
 
-def sampleQ(h_enc, e):  # FIXED: Pass e as parameter
-    with tf.variable_scope("mu", reuse=tf.AUTO_REUSE):
-        mu = linear(h_enc, z_size)
-    with tf.variable_scope("sigma", reuse=tf.AUTO_REUSE):
-        logsigma = linear(h_enc, z_size)
-        sigma = tf.exp(logsigma)
-    return mu + sigma * e, mu, logsigma, sigma
+def sampleQ(h_enc, e_t):
+    mu       = linear(h_enc, z_size, scope="mu")
+    logsigma = linear(h_enc, z_size, scope="logsigma")
+    sigma    = tf.exp(logsigma)
+    return mu + sigma * e_t, mu, logsigma, sigma
 
-def decode(state, input_tensor):
-    with tf.variable_scope("decoder", reuse=tf.AUTO_REUSE):
-        return lstm_dec(input_tensor, state)
 
-def write_attn(h_dec):
-    with tf.variable_scope("writeW", reuse=tf.AUTO_REUSE):
-        w = linear(h_dec, write_n * write_n)
-    N = write_n
-    w = tf.reshape(w, [batch_size, N, N])
-    Fx, Fy, gamma = attn_window("write", h_dec, write_n)
-    Fyt = tf.transpose(Fy, perm=[0, 2, 1])
-    wr = tf.matmul(Fyt, tf.matmul(w, Fx))
-    wr = tf.reshape(wr, [batch_size, B * A])
+def write_op(h_dec):
+    w   = linear(h_dec, write_n_y * write_n_x, scope="write_patch")
+    w   = tf.reshape(w, [batch_size, write_n_y, write_n_x])
+    Fx, Fy, gamma = attn_window("write", h_dec, write_n_x, write_n_y)
+    Fyt = tf.transpose(Fy, [0, 2, 1])
+    wr  = tf.matmul(Fyt, tf.matmul(w, Fx))
+    wr  = tf.reshape(wr, [batch_size, B * A])
     return wr * tf.reshape(1.0 / gamma, [-1, 1])
 
-# ============================================
-# REBUILD GRAPH FOR INFERENCE
-# ============================================
 
-def load_and_visualize(model_path, data_path=None, num_samples=8):
-    """Load trained model and generate visualizations"""
-    
-    tf.reset_default_graph()
-    
-    # Placeholders - FIXED: Define e as a placeholder
-    x = tf.placeholder(tf.float32, shape=(batch_size, img_size))
-    e = tf.placeholder(tf.float32, shape=(batch_size, z_size))  # FIXED: e as placeholder
-    
-    # RNN cells
+# ============================================================
+# GRAPH BUILDER
+# ============================================================
+
+def build_graph():
     global lstm_enc, lstm_dec
+
+    tf.reset_default_graph()
+    x_ph = tf.placeholder(tf.float32, shape=(batch_size, img_size), name="x")
+
     lstm_enc = tf.contrib.rnn.LSTMCell(enc_size, state_is_tuple=True)
     lstm_dec = tf.contrib.rnn.LSTMCell(dec_size, state_is_tuple=True)
-    
-    read = read_attn
-    write = write_attn
-    
-    # Unroll the model
-    cs = [0] * T
+
+    cs         = [None] * T
     h_dec_prev = tf.zeros((batch_size, dec_size))
-    enc_state = lstm_enc.zero_state(batch_size, tf.float32)
-    dec_state = lstm_dec.zero_state(batch_size, tf.float32)
-    
+    enc_state  = lstm_enc.zero_state(batch_size, tf.float32)
+    dec_state  = lstm_dec.zero_state(batch_size, tf.float32)
+
     for t in range(T):
         c_prev = tf.zeros((batch_size, img_size)) if t == 0 else cs[t-1]
-        x_hat = x - tf.sigmoid(c_prev)
-        r = read(x, x_hat, h_dec_prev)
-        h_enc, enc_state = encode(enc_state, tf.concat([r, h_dec_prev], 1))
-        z, _, _, _ = sampleQ(h_enc, e)  # FIXED: Pass e to sampleQ
-        h_dec, dec_state = decode(dec_state, z)
-        cs[t] = c_prev + write(h_dec)
+        x_hat  = x_ph - tf.sigmoid(c_prev)
+        r      = read_op(x_ph, x_hat, h_dec_prev)
+        with tf.variable_scope("encoder", reuse=tf.AUTO_REUSE):
+            h_enc, enc_state = lstm_enc(tf.concat([r, h_dec_prev], axis=1),
+                                        enc_state)
+        e_t    = tf.random_normal((batch_size, z_size))
+        z, _, _, _ = sampleQ(h_enc, e_t)
+        with tf.variable_scope("decoder", reuse=tf.AUTO_REUSE):
+            h_dec, dec_state = lstm_dec(z, dec_state)
+        cs[t]      = c_prev + write_op(h_dec)
         h_dec_prev = h_dec
-    
-    # Reconstruction
+
     x_recons = tf.nn.sigmoid(cs[-1])
-    
-    # Load model
-    config = tf.ConfigProto(device_count={'GPU': 0})
-    sess = tf.InteractiveSession(config=config)
-    saver = tf.train.Saver()
-    
-    # Try to restore the model
+    return x_ph, cs, x_recons
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-np.clip(x, -500, 500)))
+
+
+def load_data(data_path, n=batch_size):
+    data = np.load(data_path).astype(np.float32)
+    if data.max() > 1.0:
+        data /= 255.0
+    np.random.shuffle(data)
+    batch = data[:n]
+    if len(batch) < n:
+        pad   = np.zeros((n - len(batch), img_size), dtype=np.float32)
+        batch = np.vstack([batch, pad])
+    return batch
+
+
+# ============================================================
+# PLOTS
+# ============================================================
+
+def plot_losses(save=True):
+    """Training curves: per-epoch smoothed Lx, Lz, and total."""
+    if not os.path.exists("draw_plates_results.npy"):
+        print("draw_plates_results.npy not found — skipping loss plot.")
+        return
+
+    data      = np.load("draw_plates_results.npy", allow_pickle=True)
+    Lxs, Lzs = np.array(data[0]), np.array(data[1])
+
+    # Fold per-iteration losses to per-epoch means
+    # iters_per_epoch = combined_dataset (1872) // batch_size (32) = 58
+    iters_per_epoch = 1872 // batch_size
+    n_epochs        = len(Lxs) // iters_per_epoch
+    trim            = n_epochs * iters_per_epoch
+    lx_ep = Lxs[:trim].reshape(n_epochs, iters_per_epoch).mean(axis=1)
+    lz_ep = Lzs[:trim].reshape(n_epochs, iters_per_epoch).mean(axis=1)
+    tot_ep = lx_ep + kl_weight * lz_ep
+    epochs = np.arange(1, n_epochs + 1)
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+    axes[0].plot(epochs, lx_ep, color="steelblue")
+    axes[0].axhline(0.6931 * img_size, color="grey", linestyle="--",
+                    alpha=0.6, label=f"random baseline ({0.6931*img_size:.0f})")
+    axes[0].set_title("Reconstruction Loss (Lx)")
+    axes[0].set_xlabel("Epoch"); axes[0].set_ylabel("BCE")
+    axes[0].legend(fontsize=8); axes[0].grid(alpha=0.3)
+
+    axes[1].plot(epochs, lz_ep, color="tomato")
+    axes[1].set_title("KL Loss (Lz, summed over T steps)")
+    axes[1].set_xlabel("Epoch"); axes[1].set_ylabel("KL")
+    axes[1].grid(alpha=0.3)
+
+    axes[2].plot(epochs, tot_ep, color="green")
+    axes[2].set_title(f"Total Loss (Lx + {kl_weight}·Lz)")
+    axes[2].set_xlabel("Epoch"); axes[2].grid(alpha=0.3)
+
+    plt.suptitle("DRAW Training Curves (per-epoch averages)", fontsize=13)
+    plt.tight_layout()
+    if save:
+        plt.savefig("training_losses_plot.png", dpi=150, bbox_inches="tight")
+        print("Saved training_losses_plot.png")
+    plt.show()
+
+
+def plot_reconstructions(sess, x_ph, x_recons, test_batch, n_show=8, save=True):
+    """Side-by-side originals vs reconstructions with error heatmaps."""
+    feed     = {x_ph: test_batch}
+    recon_np = sess.run(x_recons, feed)          # [batch, img_size]
+
+    n_show = min(n_show, batch_size)
+    fig, axes = plt.subplots(3, n_show, figsize=(n_show * 2, 5))
+
+    maes = []
+    for i in range(n_show):
+        orig  = test_batch[i].reshape(B, A)
+        recon = recon_np[i].reshape(B, A)
+        err   = np.abs(orig - recon)
+        maes.append(err.mean())
+
+        axes[0, i].imshow(orig,  cmap="gray", vmin=0, vmax=1)
+        axes[1, i].imshow(recon, cmap="gray", vmin=0, vmax=1)
+        im = axes[2, i].imshow(err, cmap="hot", vmin=0, vmax=0.5)
+        axes[2, i].set_title(f"MAE={err.mean():.3f}", fontsize=7)
+        for row in range(3):
+            axes[row, i].axis("off")
+
+    axes[0, 0].set_ylabel("Original",      fontsize=9)
+    axes[1, 0].set_ylabel("Reconstructed", fontsize=9)
+    axes[2, 0].set_ylabel("|Error|",        fontsize=9)
+    plt.colorbar(im, ax=axes[2, -1], fraction=0.046, pad=0.04)
+    plt.suptitle(f"DRAW Reconstructions  (mean MAE={np.mean(maes):.4f})", fontsize=12)
+    plt.tight_layout()
+    if save:
+        plt.savefig("reconstructions_final.png", dpi=150, bbox_inches="tight")
+        print("Saved reconstructions_final.png")
+    plt.show()
+
+
+def plot_progressive(sess, x_ph, cs, test_batch, n_cols=5, save=True):
+    """Show how the canvas evolves across T time steps."""
+    feed     = {x_ph: test_batch}
+    canvases = sess.run(cs, feed)   # list of T arrays, each [batch, img_size]
+
+    steps = [0, T // 5, 2 * T // 5, 3 * T // 5, 4 * T // 5, T - 1]
+    steps = sorted(set(steps))      # deduplicate
+    n_rows = len(steps) + 1         # +1 for originals
+    n_cols = min(n_cols, batch_size)
+
+    fig, axes = plt.subplots(n_rows, n_cols,
+                             figsize=(n_cols * 2, n_rows * 1.8))
+
+    for col in range(n_cols):
+        axes[0, col].imshow(test_batch[col].reshape(B, A), cmap="gray",
+                            vmin=0, vmax=1)
+        if col == 0:
+            axes[0, col].set_ylabel("Original", fontsize=8)
+        axes[0, col].axis("off")
+
+    for row, t in enumerate(steps):
+        canvas = sigmoid(canvases[t])
+        for col in range(n_cols):
+            axes[row + 1, col].imshow(canvas[col].reshape(B, A), cmap="gray",
+                                      vmin=0, vmax=1)
+            if col == 0:
+                axes[row + 1, col].set_ylabel(f"Step {t+1}", fontsize=8)
+            axes[row + 1, col].axis("off")
+
+    plt.suptitle("Canvas refinement over time steps", fontsize=12)
+    plt.tight_layout()
+    if save:
+        plt.savefig("progressive_refinement.png", dpi=150, bbox_inches="tight")
+        print("Saved progressive_refinement.png")
+    plt.show()
+
+
+def plot_comparison_with_vae(save=True):
+    """Compare DRAW and VAE baseline training curves on one figure."""
+    vae_json = os.path.join("..", "vae_baseline_metrics.json")
+    draw_npy  = "draw_plates_results.npy"
+
+    if not os.path.exists(draw_npy):
+        print("draw_plates_results.npy not found — skipping comparison.")
+        return
+
+    import json
+    draw_data = np.load(draw_npy, allow_pickle=True)
+    Lxs, Lzs = np.array(draw_data[0]), np.array(draw_data[1])
+    iters_per_epoch = 1872 // batch_size
+    n_epochs_draw   = len(Lxs) // iters_per_epoch
+    trim = n_epochs_draw * iters_per_epoch
+    draw_lx_ep  = Lxs[:trim].reshape(n_epochs_draw, -1).mean(axis=1)
+    draw_tot_ep = (Lxs[:trim] + kl_weight * Lzs[:trim]) \
+                      .reshape(n_epochs_draw, -1).mean(axis=1)
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    ep_draw = np.arange(1, n_epochs_draw + 1)
+
+    axes[0].plot(ep_draw, draw_tot_ep, color="tomato", label="DRAW (train)")
+    axes[1].plot(ep_draw, draw_lx_ep,  color="tomato", label="DRAW recon (train)")
+
+    if os.path.exists(vae_json):
+        with open(vae_json) as fh:
+            vm = json.load(fh)
+        ep_vae = np.arange(1, len(vm["train_losses"]) + 1)
+        axes[0].plot(ep_vae, vm["train_losses"], color="steelblue", label="VAE (train)")
+        axes[0].plot(ep_vae, vm["val_losses"],   color="steelblue", linestyle="--",
+                     label="VAE (val)")
+        axes[1].plot(ep_vae, vm["train_recons"], color="steelblue", label="VAE recon (train)")
+        axes[1].plot(ep_vae, vm["val_recons"],   color="steelblue", linestyle="--",
+                     label="VAE recon (val)")
+        print(f"VAE baseline: final train loss={vm['train_losses'][-1]:.2f}, "
+              f"val MAE={vm.get('val_mae', 'n/a')}")
+    else:
+        print(f"VAE metrics not found at {vae_json} — plotting DRAW only.")
+
+    axes[0].set_title("Total Loss (ELBO)");    axes[0].set_xlabel("Epoch")
+    axes[1].set_title("Reconstruction Loss");  axes[1].set_xlabel("Epoch")
+    for ax in axes:
+        ax.legend(fontsize=8); ax.grid(alpha=0.3)
+
+    plt.suptitle("DRAW vs VAE Baseline", fontsize=13)
+    plt.tight_layout()
+    if save:
+        plt.savefig("draw_vs_vae_comparison.png", dpi=150, bbox_inches="tight")
+        print("Saved draw_vs_vae_comparison.png")
+    plt.show()
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def run(model_path="draw_plates_model.ckpt",
+        data_path=r"draw_plate_data_prepared_combined\test_96x32.npy",
+        n_show=8):
+
+    # Always plot losses — doesn't need the model
+    plot_losses()
+    plot_comparison_with_vae()
+
+    # Check model exists before building the graph
+    if not (os.path.exists(model_path + ".index") or
+            os.path.exists(model_path)):
+        print(f"Model not found at {model_path} — skipping reconstruction plots.")
+        return
+
+    x_ph, cs_tensors, x_recons = build_graph()
+
+    config = tf.ConfigProto(device_count={"GPU": 0})
+    sess   = tf.InteractiveSession(config=config)
+    saver  = tf.train.Saver()
+
     try:
         saver.restore(sess, model_path)
-        print(f"✅ Model loaded from: {model_path}")
-    except:
-        # Try with .ckpt extension
-        try:
-            saver.restore(sess, model_path + ".ckpt")
-            print(f"✅ Model loaded from: {model_path}.ckpt")
-        except Exception as e:
-            print(f"❌ Could not load model: {e}")
-            print("Looking for files in current directory...")
-            print(os.listdir("."))
-            return None, None
-    
-    # Load or create test data
-    if data_path and os.path.exists(data_path):
-        print(f"📂 Loading test data from: {data_path}")
-        test_data = np.load(data_path).astype(np.float32)
-        if test_data.max() > 1.0:
-            print(f"   Normalizing data (max was {test_data.max()})")
-            test_data = test_data / 255.0
-        np.random.shuffle(test_data)
-        test_batch = test_data[:num_samples]
+        print(f"Model loaded from {model_path}")
+    except Exception as exc:
+        print(f"Could not load model: {exc}")
+        sess.close()
+        return
+
+    # Load test data
+    if os.path.exists(data_path):
+        test_batch = load_data(data_path, batch_size)
     else:
-        print("⚠️ No test data provided, using random noise")
-        test_batch = np.random.rand(num_samples, img_size).astype(np.float32)
-    
-    # Pad or truncate to match batch size
-    if len(test_batch) < batch_size:
-        test_batch = np.vstack([test_batch, np.zeros((batch_size - len(test_batch), img_size))])
-    
-    # Generate reconstructions - FIXED: Provide e feed_dict
-    print("🎨 Generating reconstructions...")
-    random_noise = np.random.normal(0, 1, (batch_size, z_size)).astype(np.float32)
-    feed_dict = {
-        x: test_batch[:batch_size],
-        e: random_noise  # FIXED: Provide noise
-    }
-    canvases = sess.run(cs, feed_dict=feed_dict)
-    reconstructions = 1.0 / (1.0 + np.exp(-np.array(canvases)))
-    
-    # ===== VISUALIZATION 1: Training Progress (if losses were saved) =====
-    if os.path.exists("draw_plates_results.npy"):
-        try:
-            saved_data = np.load("draw_plates_results.npy", allow_pickle=True)
-            if isinstance(saved_data, np.ndarray) and len(saved_data) >= 2:
-                Lxs, Lzs = saved_data[0], saved_data[1]
-                
-                plt.figure(figsize=(12, 5))
-                
-                plt.subplot(1, 2, 1)
-                plt.plot(Lxs, label='Reconstruction Loss (Lx)', alpha=0.7)
-                plt.plot(Lzs, label='KL Loss (Lz)', alpha=0.7)
-                plt.xlabel('Iteration')
-                plt.ylabel('Loss')
-                plt.title('Training Losses')
-                plt.legend()
-                plt.grid(True, alpha=0.3)
-                
-                plt.subplot(1, 2, 2)
-                plt.plot(np.array(Lxs) + np.array(Lzs), label='Total Loss', color='green', alpha=0.7)
-                plt.xlabel('Iteration')
-                plt.ylabel('Loss')
-                plt.title('Total Loss')
-                plt.legend()
-                plt.grid(True, alpha=0.3)
-                
-                plt.tight_layout()
-                plt.savefig('training_losses_plot.png', dpi=150)
-                print("📊 Saved: training_losses_plot.png")
-                plt.close()
-        except Exception as e:
-            print(f"⚠️ Could not plot losses: {e}")
-    
-    # ===== VISUALIZATION 2: Sample Reconstructions =====
-    final_recon = reconstructions[-1][:num_samples]
-    
-    fig, axes = plt.subplots(2, num_samples, figsize=(num_samples * 2, 4))
-    if num_samples == 1:
-        axes = axes.reshape(-1, 1)
-    
-    for i in range(num_samples):
-        # Original
-        axes[0, i].imshow(test_batch[i].reshape(B, A), cmap='gray')
-        axes[0, i].set_title(f'Original {i+1}')
-        axes[0, i].axis('off')
-        
-        # Reconstruction
-        axes[1, i].imshow(final_recon[i].reshape(B, A), cmap='gray')
-        axes[1, i].set_title(f'Recon {i+1}')
-        axes[1, i].axis('off')
-    
-    plt.suptitle(f'License Plate Reconstructions (Final Model)', fontsize=14)
-    plt.tight_layout()
-    plt.savefig('reconstructions_final.png', dpi=150)
-    print("🖼️ Saved: reconstructions_final.png")
-    plt.close()
-    
-    # ===== VISUALIZATION 3: Progressive Refinement =====
-    time_steps_to_show = [0, T//4, T//2, 3*T//4, T-1]
-    
-    fig, axes = plt.subplots(len(time_steps_to_show), min(4, num_samples), 
-                              figsize=(min(4, num_samples) * 2, len(time_steps_to_show) * 2))
-    
-    for row, t in enumerate(time_steps_to_show):
-        recon_at_t = 1.0 / (1.0 + np.exp(-canvases[t]))[:min(4, num_samples)]
-        for col in range(min(4, num_samples)):
-            axes[row, col].imshow(recon_at_t[col].reshape(B, A), cmap='gray')
-            if col == 0:
-                axes[row, col].set_ylabel(f'Step {t+1}', fontsize=10)
-            axes[row, col].axis('off')
-    
-    plt.suptitle('Progressive Refinement Over Time Steps', fontsize=14)
-    plt.tight_layout()
-    plt.savefig('progressive_refinement.png', dpi=150)
-    print("📈 Saved: progressive_refinement.png")
-    plt.close()
-    
-    # ===== VISUALIZATION 4: Side-by-Side Comparison Grid =====
-    fig, axes = plt.subplots(4, 4, figsize=(8, 8))
-    for i, ax in enumerate(axes.flat):
-        if i < num_samples:
-            ax.imshow(test_batch[i].reshape(B, A), cmap='gray')
-            ax.set_title(f'Original {i+1}', fontsize=8)
-        else:
-            ax.axis('off')
-    plt.suptitle('Sample Test Images', fontsize=12)
-    plt.tight_layout()
-    plt.savefig('test_samples.png', dpi=150)
-    print("📸 Saved: test_samples.png")
-    plt.close()
-    
-    # ===== VISUALIZATION 5: Reconstruction Error Map =====
-    for i in range(min(3, num_samples)):
-        original = test_batch[i].reshape(B, A)
-        reconstructed = final_recon[i].reshape(B, A)
-        error_map = np.abs(original - reconstructed)
-        
-        fig, axes = plt.subplots(1, 3, figsize=(9, 3))
-        axes[0].imshow(original, cmap='gray')
-        axes[0].set_title('Original')
-        axes[0].axis('off')
-        
-        axes[1].imshow(reconstructed, cmap='gray')
-        axes[1].set_title('Reconstructed')
-        axes[1].axis('off')
-        
-        im = axes[2].imshow(error_map, cmap='hot', vmin=0, vmax=1)
-        axes[2].set_title('Error Map')
-        axes[2].axis('off')
-        plt.colorbar(im, ax=axes[2])
-        
-        plt.suptitle(f'Reconstruction Error - Sample {i+1}')
-        plt.tight_layout()
-        plt.savefig(f'reconstruction_error_{i+1}.png', dpi=150)
-        plt.close()
-    print("🔥 Saved: reconstruction error maps")
-    
+        fallback = r"draw_plate_data_prepared_combined\license_plates_combined_96x32.npy"
+        print(f"Test split not found — using combined dataset ({fallback})")
+        test_batch = load_data(fallback, batch_size)
+
+    plot_reconstructions(sess, x_ph, x_recons, test_batch, n_show=n_show)
+    plot_progressive(sess, x_ph, cs_tensors, test_batch, n_cols=min(5, n_show))
+
     sess.close()
-    print("\n✅ All visualizations complete!")
-    
-    return reconstructions, canvases
+    print("Done.")
 
-# ============================================
-# QUICK LOSS PLOT ONLY (Simplest version)
-# ============================================
-
-def plot_losses_only():
-    """Just plot the losses from saved results file"""
-    try:
-        data = np.load("draw_plates_results.npy", allow_pickle=True)
-        Lxs, Lzs = data[0], data[1]
-        
-        plt.figure(figsize=(12, 5))
-        
-        plt.subplot(1, 2, 1)
-        plt.plot(Lxs, label='Reconstruction Loss (Lx)', linewidth=1)
-        plt.plot(Lzs, label='KL Loss (Lz)', linewidth=1)
-        plt.xlabel('Iteration')
-        plt.ylabel('Loss')
-        plt.title('Training Losses')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        
-        plt.subplot(1, 2, 2)
-        plt.plot(np.array(Lxs) + np.array(Lzs), label='Total Loss', color='green', linewidth=1)
-        plt.xlabel('Iteration')
-        plt.ylabel('Loss')
-        plt.title('Total Loss')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        plt.savefig('loss_plot.png', dpi=150)
-        plt.show()
-        print("✅ Loss plot saved to loss_plot.png")
-        
-    except Exception as e:
-        print(f"❌ Could not load losses: {e}")
-        print("Make sure draw_plates_results.npy exists")
-
-# ============================================
-# RUN VISUALIZATION
-# ============================================
 
 if __name__ == "__main__":
-    # Paths (adjust as needed)
-    MODEL_PATH = "draw_plates_model.ckpt"  # Your saved model
-    DATA_PATH = "draw_plate_data_prepared_rectangle/license_plates_96x32.npy"
-    
-    # Option 1: Just plot losses (if you don't have the model)
-    # plot_losses_only()
-    
-    # Option 2: Full visualization with model
-    if os.path.exists(MODEL_PATH + ".index") or os.path.exists(MODEL_PATH):
-        reconstructions, canvases = load_and_visualize(MODEL_PATH, DATA_PATH, num_samples=8)
-    else:
-        print(f"⚠️ Model not found at: {MODEL_PATH}")
-        print("Generating loss plot only...")
-        plot_losses_only()
+    run()
