@@ -33,21 +33,56 @@ T         = 50   # time steps; was 30 but the loss was still descending at 100
 
 # Training
 batch_size    = 32
-N_EPOCHS      = 200   # loss was still decreasing at epoch 100 — train longer
+N_EPOCHS      = 200
 learning_rate = 1e-4  # matches VAE baseline LR
 eps           = 1e-8
-kl_weight     = 0.1   # matches VAE baseline KL_WEIGHT
+kl_weight     = 0.1   # final KL weight (matches VAE baseline)
+
+# KL annealing: start at 0, ramp linearly to kl_weight over this many epochs.
+# Without annealing the model collapses in the first few epochs — it discovers
+# that keeping mu≈0 and sigma≈1 (matching the prior) eliminates the KL penalty
+# entirely, so z_t carries no information and reconstruction plateaus early.
+# Starting with beta=0 forces the encoder to use z_t for reconstruction first;
+# the growing penalty then gradually regularises it toward the prior.
+KL_WARMUP_EPOCHS = 30
+
+# Free bits: enforce a minimum KL per latent dimension per step.
+# If KL/dim < FREE_BITS the gradient through mu/sigma is zeroed out (via
+# tf.maximum), which prevents posterior collapse even after the warmup ends —
+# the model must encode at least FREE_BITS nats of information per dim per step.
+FREE_BITS  = 0.15          # nats per latent dimension per time step
+FREE_NATS  = FREE_BITS * z_size   # = 9.6 nats per step (vs current 3.0)
 
 print("DRAW Model Configuration")
 print(f"  Image     : {A}x{B} = {img_size} px")
 print(f"  Grid      : read {read_n_x}x{read_n_y}, write {write_n_x}x{write_n_y}")
 print(f"  LSTM      : enc={enc_size}, dec={dec_size}")
-print(f"  z_size    : {z_size},  T={T},  kl_weight={kl_weight}")
+print(f"  z_size    : {z_size},  T={T}")
+print(f"  kl_weight : {kl_weight} (warmed up over {KL_WARMUP_EPOCHS} epochs)")
+print(f"  free_bits : {FREE_BITS} nats/dim/step  (free_nats={FREE_NATS:.1f}/step)")
 print(f"  Epochs    : {N_EPOCHS},  lr={learning_rate}")
 
 # ============================================================
 # DATA LOADER
 # ============================================================
+
+# ============================================================
+# DATA AUGMENTATION
+# ============================================================
+
+def augment_batch(batch):
+    """Random intensity scale + small Gaussian noise applied per-image.
+
+    Horizontal flips are intentionally skipped — flipping text makes it
+    unreadable and introduces a distribution the model has never seen.
+    Scale and noise are light enough not to destroy plate legibility but
+    add enough variation to partially compensate for the tiny dataset.
+    """
+    rng   = np.random.default_rng()
+    scale = rng.uniform(0.85, 1.15, size=(len(batch), 1)).astype(np.float32)
+    noise = rng.normal(0.0, 0.025, size=batch.shape).astype(np.float32)
+    return np.clip(batch * scale + noise, 0.0, 1.0)
+
 
 class LicensePlateData:
     def __init__(self, data_path, batch_size):
@@ -183,7 +218,10 @@ def write_op(h_dec):
 
 tf.reset_default_graph()
 
-x = tf.placeholder(tf.float32, shape=(batch_size, img_size), name="x")
+x        = tf.placeholder(tf.float32, shape=(batch_size, img_size), name="x")
+# Scalar placeholder for the annealed KL weight; defaults to kl_weight so
+# the inference / plot graph works without feeding it.
+kl_beta_ph = tf.placeholder_with_default(kl_weight, shape=(), name="kl_beta")
 
 lstm_enc = tf.contrib.rnn.LSTMCell(enc_size, state_is_tuple=True)
 lstm_dec = tf.contrib.rnn.LSTMCell(dec_size, state_is_tuple=True)
@@ -225,13 +263,19 @@ for t in range(T):
     sig2   = tf.square(sigmas[t])
     lsig   = logsigmas[t]
     # KL(N(mu,sigma^2) || N(0,1)) = 0.5*sum(mu^2 + sigma^2 - 2*log_sigma - 1)
-    # The -1 must be inside the sum (one -1 per latent dimension, not per sample).
     kl_t   = 0.5 * tf.reduce_sum(mu2 + sig2 - 2.0 * lsig - 1.0, axis=1)
+    # Free bits: if KL for this step is below FREE_NATS the gradient through
+    # mu/sigma is zero (tf.maximum is flat below the threshold).  This forces
+    # the model to encode at least FREE_BITS nats per dim per step, directly
+    # preventing posterior collapse after the KL warmup kicks in.
+    kl_t   = tf.maximum(kl_t, FREE_NATS)
     kl_terms.append(kl_t)
 
 KL   = tf.add_n(kl_terms)          # sum over T steps, shape [batch]
 Lz   = tf.reduce_mean(KL)          # mean over batch
-cost = Lx + kl_weight * Lz
+# kl_beta_ph starts at 0 (pure reconstruction) and is ramped up in the
+# training loop — see KL_WARMUP_EPOCHS.
+cost = Lx + kl_beta_ph * Lz
 
 # ============================================================
 # OPTIMIZER

@@ -20,3 +20,7 @@ UC3M-LP/
 *.log
 *.png
 *.zip
+cuda-keyring_1.1-1_all.deb
+*.deb
+draw_plate_data_prepared_combined/chinese_plates/license_plates_combined_96x32.npy
+draw_plate_data_prepared_combined/chinese_plates/val_96x32.npy
