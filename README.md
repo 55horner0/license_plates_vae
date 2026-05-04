@@ -1,3 +1,5 @@
+### License plate project comparison between Variational Auto Encoders (Kingma 2022) and DRAW VAE (Gregor 2015).
+
 This project includes code from https://github.com/ericjang/draw
 
 Licensed under the Apache License 2.0.
@@ -14,3 +16,9 @@ usage:
 We're using data from:
 1. https://www.kaggle.com/datasets/andrewmvd/car-plate-detection
 2. https://www.kaggle.com/datasets/abdelhamidzakaria/european-license-plates-dataset
+
+Paper of reference for DRAW VAE:
+Gregor, K., Danihelka, I., Graves, A., & Wierstra, D. (2015). DRAW: A recurrent neural network for image generation. arXiv preprint arXiv:1502.04623. http://arxiv.org/abs/1502.04623
+
+Reference for VAE:
+Kingma, D. P., & Welling, M. (2022). Auto-encoding variational Bayes. arXiv preprint arXiv:1312.6114. https://arxiv.org/abs/1312.6114
